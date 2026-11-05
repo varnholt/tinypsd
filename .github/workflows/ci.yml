@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows MSVC
+            os: windows-latest
+            configure: ""
+          - name: Linux GCC 14
+            os: ubuntu-24.04
+            configure: -DCMAKE_CXX_COMPILER=g++-14
+          - name: Linux Clang 20
+            os: ubuntu-24.04
+            configure: -DCMAKE_CXX_COMPILER=clang++-20
+          - name: macOS AppleClang
+            os: macos-15
+            configure: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # clang 18 cannot use libstdc++'s std::expected, clang 19+ can
+      - name: Install Clang 20
+        if: contains(matrix.configure, 'clang++-20')
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 20
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.configure }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure --verbose
+
+      - name: Example
+        shell: bash
+        run: |
+          tool=build/examples/psd_layers
+          if [ -f build/examples/Release/psd_layers.exe ]; then tool=build/examples/Release/psd_layers.exe; fi
+          "$tool" tests/data/psd-tools/group.psd layers
+          ls layers
+
+      # the package must pull in nothing but the header
+      - name: Install and consume with find_package
+        shell: bash
+        run: |
+          cmake --install build --config Release --prefix "$PWD/prefix"
+          cmake -S tests/package_consumer -B consumer -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/prefix" ${{ matrix.configure }}
+          cmake --build consumer --config Release
+          if [ -f consumer/Release/consumer.exe ]; then consumer/Release/consumer.exe; else consumer/consumer; fi
+
+  sanitizers:
+    name: Sanitizers and fuzzing (Clang 20)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Clang 20 with the sanitizer and libFuzzer runtimes
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 20
+          sudo apt-get install -y libclang-rt-20-dev
+
+      - name: Tests under address and undefined behavior sanitizers
+        run: |
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++-20 \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+          cmake --build build-asan --parallel
+          ctest --test-dir build-asan --output-on-failure
+
+      - name: Fuzz for 60 seconds
+        run: |
+          cmake -S . -B build-fuzz -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++-20 \
+            -DTINYPSD_BUILD_TESTS=OFF -DTINYPSD_BUILD_EXAMPLES=OFF -DTINYPSD_BUILD_FUZZER=ON
+          cmake --build build-fuzz --parallel
+          mkdir -p corpus
+          cp tests/data/psd-tools/*.psd corpus/
+          ./build-fuzz/tests/fuzz/tinypsd_fuzz corpus -max_total_time=60 -max_len=65536 -rss_limit_mb=1024
