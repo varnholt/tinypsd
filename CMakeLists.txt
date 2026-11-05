@@ -29,8 +29,17 @@ if(TINYPSD_BUILD_TESTS
     if(MSVC)
         target_compile_options(tinypsd_warnings INTERFACE /W4 /WX /permissive- /utf-8)
     else()
-        target_compile_options(tinypsd_warnings INTERFACE -Wall -Wextra -Wpedantic -Wconversion
-                                                          -Wshadow -Werror)
+        # partially initialized aggregates like {._pixel_format = ...} are the intended way to use
+        # the options
+        target_compile_options(
+            tinypsd_warnings
+            INTERFACE -Wall
+                      -Wextra
+                      -Wpedantic
+                      -Wconversion
+                      -Wshadow
+                      -Werror
+                      -Wno-missing-field-initializers)
     endif()
 endif()
 
