@@ -1,0 +1,22 @@
+[package]
+name = "tinypsd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tinypsd = { path = ".." }
+
+[[bin]]
+name = "load"
+path = "fuzz_targets/load.rs"
+test = false
+doc = false
+bench = false
+
+# keeps the fuzz crate out of the parent's workspace
+[workspace]
