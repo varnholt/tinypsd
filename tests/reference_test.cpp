@@ -3,8 +3,13 @@
 // color modes has to decode to the same pixels, and names, groups and flags have to match what photoshop shows.
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <numeric>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -144,6 +149,140 @@ TEST_CASE("reference: a gimp file with transparency")
          transparent = transparent || pixels[index] < 255;
       }
       CHECK(transparent);
+   }
+}
+
+// the expected values below are what psd-tools 1.10.9 reads from the same files
+
+namespace
+{
+
+uint64_t maskSum(const tinypsd::LayerMask& mask)
+{
+   return std::accumulate(mask._values.begin(), mask._values.end(), uint64_t{0});
+}
+
+bool boundsAre(const tinypsd::Rect& bounds, int32_t left, int32_t top, int32_t right, int32_t bottom)
+{
+   return bounds._left == left && bounds._top == top && bounds._right == right && bounds._bottom == bottom;
+}
+
+bool anchorIs(const tinypsd::Knot& knot, float x, float y)
+{
+   return std::abs(knot._anchor._x - x) < 0.01f && std::abs(knot._anchor._y - y) < 0.01f;
+}
+
+}  // namespace
+
+TEST_CASE("reference: a layer mask and a shape layer's vector mask")
+{
+   for (const auto* const name : {"mask.psd", "mask-disabled.psd"})
+   {
+      const auto document = loadReference(name);
+      CHECK(names(document) == std::vector<std::string>({"Background", "Background copy", "Shape 1"}));
+      if (document._layers.size() != 3)
+      {
+         continue;
+      }
+      CHECK(!document._layers[0]._mask && !document._layers[0]._vector_mask);
+
+      const auto& masked = document._layers[1];
+      CHECK_MESSAGE(masked._mask.has_value(), "{}", name);
+      if (masked._mask)
+      {
+         CHECK(boundsAre(masked._mask->_bounds, 23, 10, 94, 67));
+         CHECK(masked._mask->_default_color == 0);
+         CHECK(masked._mask->_disabled == (std::string_view{name} == "mask-disabled.psd"));
+         CHECK_MESSAGE(maskSum(*masked._mask) == 874692, "{}: mask sum {}", name, maskSum(*masked._mask));
+      }
+      CHECK(!masked._vector_mask);
+
+      const auto& shape = document._layers[2];
+      CHECK(!shape._mask && shape._vector_mask.has_value());
+      if (shape._vector_mask)
+      {
+         const auto& vector_mask = *shape._vector_mask;
+         CHECK(!vector_mask._inverted && vector_mask._linked && !vector_mask._disabled && !vector_mask._starts_filled);
+         CHECK(vector_mask._subpaths.size() == 1);
+         if (vector_mask._subpaths.size() == 1 && vector_mask._subpaths[0]._knots.size() == 4)
+         {
+            CHECK(vector_mask._subpaths[0]._closed);
+            CHECK(anchorIs(vector_mask._subpaths[0]._knots[0], 17.0f, 38.0f));
+            CHECK(anchorIs(vector_mask._subpaths[0]._knots[1], 82.0f, 38.0f));
+         }
+         else
+         {
+            CHECK_MESSAGE(false, "{}: unexpected subpaths", name);
+         }
+      }
+   }
+}
+
+TEST_CASE("reference: layer and vector mask on one layer, with density")
+{
+   const auto document = loadReference("mask-density-layervectormask.psd");
+   CHECK(document._layers.size() == 5);
+   if (document._layers.size() != 5)
+   {
+      return;
+   }
+   // each layer has a painted mask and a vector mask, so photoshop writes two mask channels: -2 is the vector mask
+   // rendered to pixels (around the shape, default 0) and -3 the painted mask (the whole layer, default 255). the
+   // specification calls -3 the real user mask, and that is what _mask holds. psd-tools 1.10.9 returns -2 instead.
+   // bounds and sums are those of channel -3 as psd-tools decodes it
+   struct Expected
+   {
+      int32_t _top;
+      int32_t _right;
+      uint64_t _sum;
+      std::optional<uint8_t> _density;
+   };
+   const auto expected = std::to_array<Expected>({
+      {0, 32, 43104, uint8_t{64}},
+      {8, 32, 43107, uint8_t{128}},
+      {16, 32, 43102, uint8_t{191}},
+      {24, 31, 41072, std::nullopt},
+   });
+   for (std::size_t index = 0; index < expected.size(); ++index)
+   {
+      const auto& layer = document._layers[index + 1];
+      const auto& want = expected[index];
+      CHECK_MESSAGE(layer._mask && layer._vector_mask, "{}: both masks", layer._name);
+      if (!layer._mask || !layer._vector_mask)
+      {
+         continue;
+      }
+      CHECK_MESSAGE(boundsAre(layer._mask->_bounds, 0, want._top, want._right, want._top + 8), "{}: mask bounds", layer._name);
+      CHECK_MESSAGE(layer._mask->_default_color == 255, "{}: default color", layer._name);
+      CHECK_MESSAGE(maskSum(*layer._mask) == want._sum, "{}: mask sum {} instead of {}", layer._name, maskSum(*layer._mask), want._sum);
+      CHECK_MESSAGE(layer._mask->_density == want._density, "{}: mask density", layer._name);
+      CHECK_MESSAGE(layer._vector_mask->_density == want._density, "{}: vector mask density", layer._name);
+
+      const auto& subpaths = layer._vector_mask->_subpaths;
+      const auto row = static_cast<float>(index) * 8.0f;
+      CHECK_MESSAGE(
+         subpaths.size() == 1 && subpaths[0]._knots.size() == 4 && anchorIs(subpaths[0]._knots[0], 16.0f, row) &&
+            anchorIs(subpaths[0]._knots[1], 32.0f, row),
+         "{}: vector mask knots",
+         layer._name
+      );
+   }
+}
+
+TEST_CASE("reference: mask parameters without a real mask channel")
+{
+   // psd-tools 1.10.9 fails on this file; it has to load here, with consistent masks
+   const auto document = loadReference("mask-parameters-no-real-channel.psd");
+   CHECK(!document._layers.empty());
+   for (const auto& layer : document._layers)
+   {
+      if (layer._mask && !layer._mask->_values.empty())
+      {
+         CHECK(
+            layer._mask->_values.size() ==
+            static_cast<std::size_t>(layer._mask->_bounds.width()) * static_cast<std::size_t>(layer._mask->_bounds.height())
+         );
+      }
    }
 }
 
