@@ -1,0 +1,22 @@
+[package]
+name = "tinypsd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Photoshop (.psd) loader: layers, groups, unicode names, 8/16/32 bit, RLE and zip, masks, the composite and paths. No dependencies, no unsafe, bounds checked and fuzzed."
+repository = "https://github.com/varnholt/tinypsd"
+homepage = "https://github.com/varnholt/tinypsd/tree/main/rust"
+documentation = "https://docs.rs/tinypsd"
+readme = "README.md"
+license = "MIT"
+keywords = ["psd", "photoshop", "image", "layers", "gamedev"]
+categories = ["multimedia::images", "parser-implementations", "game-development"]
+include = ["src/**/*.rs", "tests/zlib_vectors.rs", "README.md", "LICENSE", "rustfmt.toml"]
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+cast_lossless = "warn"

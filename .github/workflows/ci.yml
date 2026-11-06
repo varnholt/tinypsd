@@ -94,3 +94,69 @@ jobs:
           mkdir -p corpus
           cp tests/data/psd-tools/*.psd corpus/
           ./build-fuzz/tests/fuzz/tinypsd_fuzz corpus -max_total_time=60 -max_len=65536 -rss_limit_mb=1024
+
+  rust:
+    name: Rust (${{ matrix.os }}, ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            toolchain: stable
+          - os: windows-latest
+            toolchain: stable
+          - os: macos-15
+            toolchain: stable
+          - os: ubuntu-24.04
+            toolchain: "1.85" # rust-version in rust/Cargo.toml
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ matrix.toolchain }}
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component clippy,rustfmt
+          rustup default ${{ matrix.toolchain }}
+
+      - name: Format and lint
+        if: matrix.toolchain == 'stable'
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+
+      # debug builds panic on integer overflow, so the robustness tests also catch arithmetic that would wrap
+      - name: Test in debug and release
+        run: |
+          cargo test
+          cargo test --release
+
+      - name: Docs and package
+        if: matrix.toolchain == 'stable'
+        shell: bash
+        run: |
+          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+          cargo package --allow-dirty
+
+      - name: Example
+        run: cargo run --example psd_layers -- ../tests/data/psd-tools/group.psd layers
+
+  rust-fuzz:
+    name: Rust fuzzing (cargo-fuzz)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+
+      - name: Fuzz for 60 seconds
+        working-directory: rust
+        run: |
+          mkdir -p fuzz/corpus/load
+          cp ../tests/data/psd-tools/*.ps? fuzz/corpus/load/
+          cargo +nightly fuzz run load fuzz/corpus/load -- -max_total_time=60 -max_len=131072 -rss_limit_mb=1024

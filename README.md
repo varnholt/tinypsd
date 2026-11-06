@@ -12,6 +12,9 @@ visibility, blend mode and groups, decoded to 8 bit RGBA, plus the merged compos
 - built for untrusted files: every read is bounds checked, sizes are validated before anything is allocated, and
   CI runs the tests under address and undefined behavior sanitizers and fuzzes the loader
 
+Also available for Rust: [`rust/`](rust) is a port with the same API and no dependencies, held to decode every test
+file to the same bytes as the C++ header.
+
 ## Usage
 
 ```cpp
@@ -126,6 +129,13 @@ ctest --test-dir build -C Release --output-on-failure
   [psd-tools](https://github.com/psd-tools/psd-tools): the same image saved at 8, 16 and 32 bit and in other color
   modes has to decode to the same pixels.
 - CI runs both under ASan and UBSan, and fuzzes `load()` with libFuzzer for a minute.
+
+## Rust
+
+[`rust/`](rust) holds the `tinypsd` crate: the same loader in safe Rust, without dependencies. `tests/digest.cpp` and
+`rust/tests/parity.rs` print everything both decode from the test files, truncated and corrupted versions included, and
+compare it with `tests/data/digest.txt`, so the two cannot drift apart. After an intended change to the decoded output,
+regenerate the file with `tinypsd_digest tests/data/psd-tools --write tests/data/digest.txt`.
 
 ## Background
 
