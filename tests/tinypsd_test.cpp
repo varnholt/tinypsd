@@ -588,13 +588,13 @@ TEST_CASE("32 bit transparency is coverage too, in layers and in the composite")
    {
       const auto bits = std::bit_cast<uint32_t>(value);
       std::vector<uint8_t> bytes;
+      // push_back rather than insert of an initializer list, which gcc 14 flags with a false stringop-overflow
       for (std::size_t index = 0; index < count; ++index)
       {
-         bytes.insert(
-            bytes.end(),
-            {static_cast<uint8_t>(bits >> 24), static_cast<uint8_t>(bits >> 16), static_cast<uint8_t>(bits >> 8), static_cast<uint8_t>(bits)
-            }
-         );
+         for (const auto shift : {24, 16, 8, 0})
+         {
+            bytes.push_back(static_cast<uint8_t>(bits >> shift));
+         }
       }
       return bytes;
    };
