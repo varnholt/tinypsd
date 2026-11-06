@@ -54,14 +54,15 @@ std::vector<uint8_t> to16(std::span<const uint8_t> values)
 }
 
 /// \brief 8 bit values to 32 bit big endian linear floats that the loader's srgb encoding maps back to v.
-std::vector<uint8_t> to32(std::span<const uint8_t> values)
+/// \param linear true for coverage (transparency, masks), which photoshop stores without the srgb curve
+std::vector<uint8_t> to32(std::span<const uint8_t> values, bool linear = false)
 {
    std::vector<uint8_t> samples;
    for (const auto value : values)
    {
       const auto encoded = static_cast<float>(value) / 255.0f;
-      const auto linear = encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
-      const auto bits = std::bit_cast<uint32_t>(linear);
+      const auto decoded = linear ? encoded : encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
+      const auto bits = std::bit_cast<uint32_t>(decoded);
       for (const auto shift : {24, 16, 8, 0})
       {
          samples.push_back(static_cast<uint8_t>(bits >> shift));
@@ -70,7 +71,7 @@ std::vector<uint8_t> to32(std::span<const uint8_t> values)
    return samples;
 }
 
-std::vector<uint8_t> atDepth(std::span<const uint8_t> values, uint16_t depth)
+std::vector<uint8_t> atDepth(std::span<const uint8_t> values, uint16_t depth, bool linear = false)
 {
    if (depth == 16)
    {
@@ -78,7 +79,7 @@ std::vector<uint8_t> atDepth(std::span<const uint8_t> values, uint16_t depth)
    }
    if (depth == 32)
    {
-      return to32(values);
+      return to32(values, linear);
    }
    return {values.begin(), values.end()};
 }
@@ -95,7 +96,7 @@ test::DocumentData makeRgbDocument(uint16_t depth, test::Compression compression
    full._name = "full";
    for (const auto id : std::to_array<int16_t>({0, 1, 2, -1}))
    {
-      full._channels.push_back({id, atDepth(pattern(width, height, id + 2), depth), compression});
+      full._channels.push_back({id, atDepth(pattern(width, height, id + 2), depth, id == -1), compression});
    }
 
    // an offset layer, partly outside the document, without a transparency channel
@@ -578,6 +579,56 @@ TEST_CASE("16 and 32 bit masks are coverage, not srgb encoded colors")
    data16._layers = {layer16};
    const auto document16 = loadOrFail(test::writePsd(data16));
    CHECK(!document16._layers.empty() && document16._layers[0]._mask && document16._layers[0]._mask->_values == std::vector<uint8_t>({128}));
+}
+
+TEST_CASE("32 bit transparency is coverage too, in layers and in the composite")
+{
+   // half transparent mid gray: the color gets the srgb curve (0.5 -> 188), the transparency stays linear (0.5 -> 128)
+   const auto floats = [](float value, std::size_t count)
+   {
+      const auto bits = std::bit_cast<uint32_t>(value);
+      std::vector<uint8_t> bytes;
+      // push_back rather than insert of an initializer list, which gcc 14 flags with a false stringop-overflow
+      for (std::size_t index = 0; index < count; ++index)
+      {
+         for (const auto shift : {24, 16, 8, 0})
+         {
+            bytes.push_back(static_cast<uint8_t>(bits >> shift));
+         }
+      }
+      return bytes;
+   };
+
+   for (const auto compression : {test::Compression::Raw, test::Compression::PackBits, test::Compression::ZipPredicted})
+   {
+      test::DocumentData data{._width = 3, ._height = 2, ._depth = 32, ._channels = 4};
+      test::LayerData layer{0, 0, 2, 3};
+      for (const auto id : std::to_array<int16_t>({0, 1, 2, -1}))
+      {
+         layer._channels.push_back({id, floats(0.5f, 6), compression});
+      }
+      data._layers = {layer};
+      data._negative_layer_count = true;  // the composite's fourth channel is its transparency
+      data._composite = {floats(0.5f, 6), floats(0.5f, 6), floats(0.5f, 6), floats(0.25f, 6)};
+      // the composite supports raw, packbits and zip; zip with prediction is only for layers
+      data._composite_compression = compression == test::Compression::ZipPredicted ? test::Compression::Zip : compression;
+
+      const auto document = loadOrFail(test::writePsd(data));
+      const auto expect_pixel = [&](const tinypsd::Image& image, uint8_t alpha, std::string_view what)
+      {
+         const auto ok =
+            image._pixels.size() == 6 * 4 && image._pixels[0] == 188 && image._pixels[3] == alpha && image._pixels[23] == alpha;
+         CHECK_MESSAGE(
+            ok, "compression {}: {} pixel {}", static_cast<int32_t>(compression), what, image._pixels.empty() ? -1 : image._pixels[3]
+         );
+      };
+      CHECK(!document._layers.empty());
+      if (!document._layers.empty())
+      {
+         expect_pixel(document._layers[0]._image, 128, "layer");
+      }
+      expect_pixel(document._composite, 64, "composite");
+   }
 }
 
 // ----------------------------------------------------------------------------------------------------
