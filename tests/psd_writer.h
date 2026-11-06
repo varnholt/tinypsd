@@ -4,8 +4,10 @@
 // so the loader is tested against files built from the specification rather than against its own reading of them.
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -29,6 +31,12 @@ struct ChannelData
    Compression _compression{Compression::Raw};
 };
 
+struct KnotData
+{
+   float _x{0.0f};  //!< fraction of the document width
+   float _y{0.0f};
+};
+
 struct LayerData
 {
    int32_t _top{0};
@@ -49,12 +57,23 @@ struct LayerData
    int32_t _mask_left{0};
    int32_t _mask_bottom{0};
    int32_t _mask_right{0};
-};
-
-struct KnotData
-{
-   float _x{0.0f};  //!< fraction of the document width
-   float _y{0.0f};
+   uint8_t _mask_default_color{255};
+   uint8_t _mask_flags{0};  //!< bit 0 position relative to layer, bit 1 disabled
+   std::optional<uint8_t> _mask_density;
+   std::optional<double> _mask_feather;
+   std::optional<uint8_t> _vector_mask_density;
+   std::optional<double> _vector_mask_feather;
+   bool _real_mask{false};  //!< writes the "real" fields; a -3 channel uses this rectangle
+   int32_t _real_mask_top{0};
+   int32_t _real_mask_left{0};
+   int32_t _real_mask_bottom{0};
+   int32_t _real_mask_right{0};
+   uint8_t _real_mask_default_color{0};
+   uint8_t _real_mask_flags{0};
+   std::vector<std::vector<KnotData>> _vector_mask;  //!< closed subpaths of a 'vmsk' block, if not empty
+   bool _vector_mask_new_key{false};                 //!< 'vsms' instead of 'vmsk'
+   uint32_t _vector_mask_flags{0};                   //!< bit 0 inverted, bit 1 not linked, bit 2 disabled
+   bool _vector_mask_starts_filled{false};           //!< writes an initial fill record
 };
 
 struct DocumentData
@@ -106,6 +125,13 @@ public:
       {
          u8(static_cast<uint8_t>(character));
       }
+   }
+
+   void f64(double value)
+   {
+      const auto bits = std::bit_cast<uint64_t>(value);
+      u32(static_cast<uint32_t>(bits >> 32));
+      u32(static_cast<uint32_t>(bits));
    }
 
    void bytes(std::span<const uint8_t> values)
@@ -312,6 +338,37 @@ encodeRows(const std::vector<std::span<const uint8_t>>& channels, int32_t width,
    return encoded;
 }
 
+/// \brief 26 byte path records: a fill rule record, optionally an initial fill record, then each closed subpath.
+inline ByteWriter pathRecords(const std::vector<std::vector<KnotData>>& subpaths, bool starts_filled)
+{
+   ByteWriter path;
+   const auto fixed = [](float value) { return static_cast<int32_t>(value * 16777216.0f); };
+   path.u16(6);  // fill rule record
+   path.padTo(26);
+   if (starts_filled)
+   {
+      path.u16(8);  // initial fill record
+      path.u16(1);
+      path.padTo(26);
+   }
+   for (const auto& knots : subpaths)
+   {
+      path.u16(0);  // closed subpath length record
+      path.u16(static_cast<uint32_t>(knots.size()));
+      path.padTo(26);
+      for (const auto& knot : knots)
+      {
+         path.u16(1);  // closed, linked
+         for (auto point = 0; point < 3; ++point)
+         {
+            path.i32(fixed(knot._y));
+            path.i32(fixed(knot._x));
+         }
+      }
+   }
+   return path;
+}
+
 inline std::vector<std::byte> writePsd(const DocumentData& document)
 {
    ByteWriter file;
@@ -337,22 +394,7 @@ inline std::vector<std::byte> writePsd(const DocumentData& document)
    ByteWriter resources;
    if (!document._path.empty())
    {
-      ByteWriter path;
-      const auto fixed = [](float value) { return static_cast<int32_t>(value * 16777216.0f); };
-      path.u16(6);  // fill rule record
-      path.padTo(26);
-      path.u16(0);  // closed subpath length record
-      path.u16(static_cast<uint32_t>(document._path.size()));
-      path.padTo(26);
-      for (const auto& knot : document._path)
-      {
-         path.u16(1);  // closed, linked
-         for (auto point = 0; point < 3; ++point)
-         {
-            path.i32(fixed(knot._y));
-            path.i32(fixed(knot._x));
-         }
-      }
+      const auto path = pathRecords({document._path}, false);
       resources.text("8BIM");
       resources.u16(2000);
       resources.u8(4);
@@ -375,9 +417,18 @@ inline std::vector<std::byte> writePsd(const DocumentData& document)
       auto& encoded = encoded_channels.emplace_back();
       for (const auto& channel : layer._channels)
       {
-         const auto is_mask = channel._id == -2;
-         const auto width = is_mask ? layer._mask_right - layer._mask_left : layer._right - layer._left;
-         const auto height = is_mask ? layer._mask_bottom - layer._mask_top : layer._bottom - layer._top;
+         auto width = layer._right - layer._left;
+         auto height = layer._bottom - layer._top;
+         if (channel._id == -2)
+         {
+            width = layer._mask_right - layer._mask_left;
+            height = layer._mask_bottom - layer._mask_top;
+         }
+         else if (channel._id == -3)
+         {
+            width = layer._real_mask_right - layer._real_mask_left;
+            height = layer._real_mask_bottom - layer._real_mask_top;
+         }
          auto data = std::vector<uint8_t>{0, static_cast<uint8_t>(channel._compression)};
          if (width > 0 && height > 0)
          {
@@ -411,17 +462,56 @@ inline std::vector<std::byte> writePsd(const DocumentData& document)
       }
 
       ByteWriter extra;
-      const auto has_mask = std::ranges::any_of(layer._channels, [](const ChannelData& channel) { return channel._id == -2; });
-      if (has_mask)
+      const auto has_mask = std::ranges::any_of(layer._channels, [](const ChannelData& channel) { return channel._id <= -2; });
+      const auto has_parameters = layer._mask_density || layer._mask_feather || layer._vector_mask_density || layer._vector_mask_feather;
+      if (has_mask || has_parameters || layer._real_mask)
       {
-         extra.u32(20);
-         extra.i32(layer._mask_top);
-         extra.i32(layer._mask_left);
-         extra.i32(layer._mask_bottom);
-         extra.i32(layer._mask_right);
-         extra.u8(255);  // default color
-         extra.u8(0);    // flags
-         extra.u16(0);   // padding
+         ByteWriter mask;
+         mask.i32(layer._mask_top);
+         mask.i32(layer._mask_left);
+         mask.i32(layer._mask_bottom);
+         mask.i32(layer._mask_right);
+         mask.u8(layer._mask_default_color);
+         mask.u8(layer._mask_flags | (has_parameters ? 0x10u : 0x00u));
+         // photoshop writes the real fields before the parameters, against the specification
+         if (layer._real_mask)
+         {
+            mask.u8(layer._real_mask_flags);
+            mask.u8(layer._real_mask_default_color);
+            mask.i32(layer._real_mask_top);
+            mask.i32(layer._real_mask_left);
+            mask.i32(layer._real_mask_bottom);
+            mask.i32(layer._real_mask_right);
+         }
+         if (has_parameters)
+         {
+            mask.u8(
+               (layer._mask_density ? 0x01u : 0u) | (layer._mask_feather ? 0x02u : 0u) | (layer._vector_mask_density ? 0x04u : 0u) |
+               (layer._vector_mask_feather ? 0x08u : 0u)
+            );
+            if (layer._mask_density)
+            {
+               mask.u8(*layer._mask_density);
+            }
+            if (layer._mask_feather)
+            {
+               mask.f64(*layer._mask_feather);
+            }
+            if (layer._vector_mask_density)
+            {
+               mask.u8(*layer._vector_mask_density);
+            }
+            if (layer._vector_mask_feather)
+            {
+               mask.f64(*layer._vector_mask_feather);
+            }
+         }
+         if (!layer._real_mask && !has_parameters)
+         {
+            mask.u16(0);  // padding, the block is 20 bytes
+         }
+         extra.u32(static_cast<uint32_t>(mask.size()));
+         extra.append(mask);
       }
       else
       {
@@ -437,6 +527,16 @@ inline std::vector<std::byte> writePsd(const DocumentData& document)
          extra.text(layer._nested_key ? "lsdk" : "lsct");
          extra.u32(4);
          extra.i32(layer._section_divider);
+      }
+      if (!layer._vector_mask.empty())
+      {
+         const auto records = pathRecords(layer._vector_mask, layer._vector_mask_starts_filled);
+         extra.text("8BIM");
+         extra.text(layer._vector_mask_new_key ? "vsms" : "vmsk");
+         extra.u32(static_cast<uint32_t>(8 + records.size()));
+         extra.u32(3);  // version
+         extra.u32(layer._vector_mask_flags);
+         extra.append(records);
       }
       if (!layer._unicode_name.empty())
       {

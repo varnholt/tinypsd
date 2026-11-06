@@ -52,14 +52,20 @@ Everything lives in namespace `tinypsd`.
 | `load(std::span<const std::byte>, LoadOptions = {})` | parses a file in memory; returns `std::expected<Document, Error>` |
 | `loadFile(path, LoadOptions = {})` | reads and parses a file |
 | `Document` | `_header` (size, depth, color mode), `_layers`, `_composite`, `_paths`, `findLayer(name)` |
-| `Layer` | `_name` (utf-8), `_bounds`, `_opacity`, `_visible`, `_clipping`, `_blend_mode`, `_section_divider`, `_image`, `isImageLayer()`, `isSectionDivider()` |
+| `Layer` | `_name` (utf-8), `_bounds`, `_opacity`, `_visible`, `_clipping`, `_blend_mode`, `_section_divider`, `_image`, `_mask`, `_vector_mask`, `isImageLayer()`, `isSectionDivider()` |
 | `Image` | `_width`, `_height`, `_pixels`, `row(y)` |
 | `Path` | the paths panel: subpaths of bezier knots in document pixels |
+| `LayerMask` | a raster mask: `_bounds`, `_default_color` outside them, `_disabled`, `_density`, `_feather`, 8 bit `_values`, `valueAt(x, y)` |
+| `VectorMask` | bezier subpaths in document pixels, `_inverted`, `_linked`, `_disabled`, `_starts_filled`, `_density`, `_feather` |
 | `LoadOptions` | `_pixel_format` (`Rgba8`, `Bgra8`), `_load_layer_pixels`, `_load_composite`, `_max_pixels` (64 megapixels by default) |
 | `Error` | `_code`, `_offset` in the file, `_detail`; `describe(error)` turns it into a sentence |
 
 Groups: photoshop stores a group as a folder layer (`OpenFolder` or `ClosedFolder`) above its content and a
 `BoundingSectionDivider` below it, all in the same flat list.
+
+Masks: a layer with both a painted mask and a vector mask also carries the vector mask rendered to pixels.
+`_mask` is the painted one, which the specification calls the real user mask (psd-tools returns the rendered
+one instead); the shapes are in `_vector_mask`. tinypsd does not apply masks to `_image`.
 
 ## What is supported
 
@@ -69,12 +75,13 @@ Groups: photoshop stores a group as a folder layer (`OpenFolder` or `ClosedFolde
 | bit depths | 1 (bitmap), 8, 16 and 32 bit. photoshop's 32 bit documents are linear and get the sRGB curve, so they match the 16 bit save of the same image |
 | compression | raw, PackBits (RLE), zip and zip with prediction, which photoshop uses for 16 and 32 bit layers |
 | layers | names (unicode), bounds, opacity, visibility, clipping, blend mode key, groups (nested too), transparency |
+| masks | raster layer masks (bounds, default color, flags, density, feather, 8 bit coverage) and vector masks (bezier subpaths, flags) |
 | also | the merged composite, saved paths |
 
 Not supported, and reported or skipped rather than misread:
 
 - the large document format (`.psb`) and Lab or multichannel documents: an error
-- layer and vector masks, adjustment layers, text and smart object contents, layer effects: skipped
+- adjustment layers, text and smart object contents, layer effects, shape fills and strokes: skipped
 - blending: tinypsd decodes the layers, it does not composite them. `_composite` is the merged image photoshop saved
 - color management: ICC profiles are ignored, CMYK is converted with a simple formula
 

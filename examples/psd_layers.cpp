@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <print>
 #include <span>
@@ -101,7 +102,7 @@ bool writePng(const std::filesystem::path& path, const tinypsd::Image& image)
 }
 
 /// \brief keeps layer names usable as file names.
-std::string fileName(std::size_t index, std::string_view name)
+std::string fileName(std::size_t index, std::string_view name, std::string_view suffix = {})
 {
    std::string safe;
    for (const auto character : name)
@@ -110,7 +111,53 @@ std::string fileName(std::size_t index, std::string_view name)
                         (character >= '0' && character <= '9') || character == '-' || character == '_';
       safe += keep ? character : '_';
    }
-   return std::format("layer_{:03}_{}.png", index, safe);
+   return std::format("layer_{:03}_{}{}.png", index, safe, suffix);
+}
+
+/// \brief a raster mask as an opaque grayscale image: white shows the layer, black hides it.
+tinypsd::Image maskImage(const tinypsd::LayerMask& mask)
+{
+   tinypsd::Image image{mask._bounds.width(), mask._bounds.height(), {}};
+   image._pixels.reserve(mask._values.size() * 4);
+   for (const auto value : mask._values)
+   {
+      image._pixels.insert(image._pixels.end(), {value, value, value, 255});
+   }
+   return image;
+}
+
+void printMasks(const tinypsd::Layer& layer)
+{
+   if (layer._mask)
+   {
+      const auto& mask = *layer._mask;
+      std::println(
+         "        mask          {:4} x {:<4} at ({}, {}) default {:3}{}{}",
+         mask._bounds.width(),
+         mask._bounds.height(),
+         mask._bounds._left,
+         mask._bounds._top,
+         mask._default_color,
+         mask._disabled ? " disabled" : "",
+         mask._density ? std::format(" density {}", *mask._density) : ""
+      );
+   }
+   if (layer._vector_mask)
+   {
+      const auto& mask = *layer._vector_mask;
+      auto knots = std::size_t{0};
+      for (const auto& subpath : mask._subpaths)
+      {
+         knots += subpath._knots.size();
+      }
+      std::println(
+         "        vector mask   {} subpaths, {} knots{}{}",
+         mask._subpaths.size(),
+         knots,
+         mask._inverted ? " inverted" : "",
+         mask._disabled ? " disabled" : ""
+      );
+   }
 }
 
 }  // namespace
@@ -152,6 +199,7 @@ int main(int argument_count, char** arguments)
          layer._opacity,
          layer._visible ? "" : " hidden"
       );
+      printMasks(layer);
    }
 
    if (argument_count < 3)
@@ -168,6 +216,10 @@ int main(int argument_count, char** arguments)
       if (!layer._image.empty())
       {
          ok = writePng(output / fileName(index, layer._name), layer._image) && ok;
+      }
+      if (layer._mask && !layer._mask->_values.empty())
+      {
+         ok = writePng(output / fileName(index, layer._name, "_mask"), maskImage(*layer._mask)) && ok;
       }
    }
    if (!document->_composite.empty())

@@ -30,6 +30,7 @@
 #include <format>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -179,30 +180,6 @@ struct Rect
    }
 };
 
-struct Layer
-{
-   std::string _name;  //!< utf-8; the unicode name if the file stores one, else the legacy name
-   Rect _bounds;
-   uint8_t _opacity{255};
-   bool _visible{true};
-   bool _clipping{false};                                //!< clipped to the layer below
-   std::array<char, 4> _blend_mode{'n', 'o', 'r', 'm'};  //!< photoshop key, e.g. "norm", "mul ", "scrn"
-   SectionDivider _section_divider{SectionDivider::None};
-   Image _image;  //!< the layer pixels, _bounds sized; empty for group markers, empty layers or if not loaded
-
-   /// \brief a group marker (folder or bounding divider) rather than content.
-   [[nodiscard]] bool isSectionDivider() const
-   {
-      return _section_divider != SectionDivider::None;
-   }
-
-   /// \brief an ordinary layer with at least one pixel.
-   [[nodiscard]] bool isImageLayer() const
-   {
-      return !isSectionDivider() && _bounds.width() > 0 && _bounds.height() > 0;
-   }
-};
-
 struct Point
 {
    float _x{0.0f};  //!< in document pixels
@@ -222,6 +199,68 @@ struct Subpath
 {
    bool _closed{false};
    std::vector<Knot> _knots;
+};
+
+/// \brief a raster layer mask: 8 bit coverage that hides the layer where it is dark.
+struct LayerMask
+{
+   Rect _bounds;                     //!< in document pixels; independent of the layer bounds
+   uint8_t _default_color{0};        //!< the value outside _bounds: 0 hides the layer there, 255 shows it
+   bool _disabled{false};            //!< switched off in photoshop; the layer shows unmasked
+   bool _relative_to_layer{false};   //!< photoshop's "position relative to layer" flag
+   std::optional<uint8_t> _density;  //!< masks panel density, 255 = full effect; absent if never changed
+   std::optional<double> _feather;   //!< masks panel feather radius in pixels; absent if never changed
+   std::vector<uint8_t> _values;     //!< _bounds sized, top row first, 255 = shown; empty if pixels were not loaded
+
+   /// \return the mask value at a document pixel, the default color outside the bounds
+   [[nodiscard]] uint8_t valueAt(int32_t x, int32_t y) const
+   {
+      if (_values.empty() || x < _bounds._left || x >= _bounds._right || y < _bounds._top || y >= _bounds._bottom)
+      {
+         return _default_color;
+      }
+      const auto index = static_cast<std::size_t>(y - _bounds._top) * static_cast<std::size_t>(_bounds.width()) +
+                         static_cast<std::size_t>(x - _bounds._left);
+      return _values[index];
+   }
+};
+
+/// \brief a vector mask: bezier shapes that clip the layer, e.g. drawn with the pen tool or from a shape layer.
+struct VectorMask
+{
+   std::vector<Subpath> _subpaths;  //!< in document pixels
+   bool _inverted{false};
+   bool _linked{true};  //!< moves with the layer
+   bool _disabled{false};
+   bool _starts_filled{false};       //!< photoshop's initial fill record: the shapes start from a filled canvas
+   std::optional<uint8_t> _density;  //!< masks panel density, 255 = full effect; absent if never changed
+   std::optional<double> _feather;   //!< masks panel feather radius in pixels; absent if never changed
+};
+
+struct Layer
+{
+   std::string _name;  //!< utf-8; the unicode name if the file stores one, else the legacy name
+   Rect _bounds;
+   uint8_t _opacity{255};
+   bool _visible{true};
+   bool _clipping{false};                                //!< clipped to the layer below
+   std::array<char, 4> _blend_mode{'n', 'o', 'r', 'm'};  //!< photoshop key, e.g. "norm", "mul ", "scrn"
+   SectionDivider _section_divider{SectionDivider::None};
+   Image _image;                            //!< the layer pixels, _bounds sized; empty for group markers, empty layers or if not loaded
+   std::optional<LayerMask> _mask;          //!< the raster mask, if the layer has one
+   std::optional<VectorMask> _vector_mask;  //!< the vector mask, if the layer has one
+
+   /// \brief a group marker (folder or bounding divider) rather than content.
+   [[nodiscard]] bool isSectionDivider() const
+   {
+      return _section_divider != SectionDivider::None;
+   }
+
+   /// \brief an ordinary layer with at least one pixel.
+   [[nodiscard]] bool isImageLayer() const
+   {
+      return !isSectionDivider() && _bounds.width() > 0 && _bounds.height() > 0;
+   }
 };
 
 /// \brief a saved path from the image resources (the paths panel), e.g. a clipping path.
@@ -344,6 +383,11 @@ public:
    [[nodiscard]] int32_t i32()
    {
       return std::bit_cast<int32_t>(u32());
+   }
+
+   [[nodiscard]] double f64()
+   {
+      return std::bit_cast<double>(bigEndian(take(8)));
    }
 
    /// \return the next count bytes, or an empty span (and the error is set) if there are fewer left
@@ -912,8 +956,25 @@ inline void undoPrediction(std::span<uint8_t> row, int32_t depth, int32_t width)
    return static_cast<uint8_t>(std::lround(encoded * 255.0f));
 }
 
+/// \brief how 32 bit float samples map to 8 bit: colors get the srgb curve, coverage like masks stays linear.
+enum class SampleEncoding : int32_t
+{
+   Color,
+   Linear,
+};
+
+[[nodiscard]] inline uint8_t linearFloatTo8(float value)
+{
+   if (!(value > 0.0f))  // also catches nan
+   {
+      return 0;
+   }
+   return value >= 1.0f ? uint8_t{255} : static_cast<uint8_t>(std::lround(value * 255.0f));
+}
+
 /// \brief converts one row of big endian samples to 8 bit.
-inline void samplesTo8Bit(std::span<const uint8_t> samples, int32_t depth, std::span<uint8_t> output)
+inline void
+samplesTo8Bit(std::span<const uint8_t> samples, int32_t depth, std::span<uint8_t> output, SampleEncoding encoding = SampleEncoding::Color)
 {
    switch (depth)
    {
@@ -932,7 +993,8 @@ inline void samplesTo8Bit(std::span<const uint8_t> samples, int32_t depth, std::
          {
             const auto bits = (static_cast<uint32_t>(samples[index * 4]) << 24) | (static_cast<uint32_t>(samples[index * 4 + 1]) << 16) |
                               (static_cast<uint32_t>(samples[index * 4 + 2]) << 8) | static_cast<uint32_t>(samples[index * 4 + 3]);
-            output[index] = floatTo8(std::bit_cast<float>(bits));
+            const auto value = std::bit_cast<float>(bits);
+            output[index] = encoding == SampleEncoding::Color ? floatTo8(value) : linearFloatTo8(value);
          }
          break;
       default:
@@ -1169,7 +1231,14 @@ private:
 
    void parsePath(Reader block, int32_t id, std::string name)
    {
-      // 26 byte records; points are 8.24 fixed point fractions of the document size, vertical first
+      _document._paths.push_back(Path{id, std::move(name), parsePathRecords(block, nullptr)});
+   }
+
+   /// \brief the 26 byte path records of a saved path or a vector mask.
+   /// \param starts_filled set from the initial fill record, if not null
+   std::vector<Subpath> parsePathRecords(Reader block, bool* starts_filled)
+   {
+      // points are 8.24 fixed point fractions of the document size, vertical first
       const auto width = static_cast<float>(_document._header._width);
       const auto height = static_cast<float>(_document._header._height);
       const auto read_point = [&](Reader& record)
@@ -1179,7 +1248,7 @@ private:
          return Point{x * width, y * height};
       };
 
-      Path path{id, std::move(name), {}};
+      std::vector<Subpath> subpaths;
       while (block.remaining() >= 26)
       {
          auto record = block.sub(26);
@@ -1189,7 +1258,7 @@ private:
             case 0:  // closed subpath length record
             case 3:  // open subpath length record
             {
-               auto& subpath = path._subpaths.emplace_back();
+               auto& subpath = subpaths.emplace_back();
                subpath._closed = type == 0;
                subpath._knots.reserve(std::min<std::size_t>(record.u16(), block.remaining() / 26));
                break;
@@ -1200,7 +1269,7 @@ private:
             case 5:  // open subpath knot, unlinked
             {
                // knots before any length record are malformed and ignored, the old loader wrote out of bounds here
-               if (path._subpaths.empty())
+               if (subpaths.empty())
                {
                   break;
                }
@@ -1209,14 +1278,20 @@ private:
                knot._anchor = read_point(record);
                knot._out = read_point(record);
                knot._linked = type == 1 || type == 4;
-               path._subpaths.back()._knots.push_back(knot);
+               subpaths.back()._knots.push_back(knot);
                break;
             }
-            default:  // fill rule, clipboard and initial fill records
+            case 8:  // initial fill record: 1 = start with all pixels filled
+               if (starts_filled != nullptr)
+               {
+                  *starts_filled = record.u16() == 1;
+               }
+               break;
+            default:  // fill rule and clipboard records
                break;
          }
       }
-      _document._paths.push_back(std::move(path));
+      return subpaths;
    }
 
    // ------------------------------------------------------------------------------------------------
@@ -1302,10 +1377,12 @@ private:
       }
 
       std::vector<std::vector<ChannelInfo>> channels(static_cast<std::size_t>(layer_count));
+      std::vector<int32_t> mask_channels(static_cast<std::size_t>(layer_count), no_mask_channel);
       _document._layers.resize(static_cast<std::size_t>(layer_count));
       for (auto index = 0; index < layer_count; ++index)
       {
-         if (!parseLayerRecord(info, _document._layers[static_cast<std::size_t>(index)], channels[static_cast<std::size_t>(index)]))
+         const auto layer_index = static_cast<std::size_t>(index);
+         if (!parseLayerRecord(info, _document._layers[layer_index], channels[layer_index], mask_channels[layer_index]))
          {
             return false;
          }
@@ -1314,7 +1391,8 @@ private:
       // the channel image data of all layers follows the records, in the same order
       for (auto index = 0; index < layer_count; ++index)
       {
-         if (!parseLayerPixels(info, _document._layers[static_cast<std::size_t>(index)], channels[static_cast<std::size_t>(index)]))
+         const auto layer_index = static_cast<std::size_t>(index);
+         if (!parseLayerPixels(info, _document._layers[layer_index], channels[layer_index], mask_channels[layer_index]))
          {
             return false;
          }
@@ -1328,7 +1406,11 @@ private:
       uint32_t _length{0};  //!< including the 2 byte compression field
    };
 
-   bool parseLayerRecord(Reader& info, Layer& layer, std::vector<ChannelInfo>& channels)
+   /// \brief channel ids: -2 is the layer mask, -3 the "real" user mask photoshop writes when a layer has both a
+   ///        user mask and a rendered one; 0 means the layer has no raster mask to decode.
+   static constexpr int32_t no_mask_channel = 0;
+
+   bool parseLayerRecord(Reader& info, Layer& layer, std::vector<ChannelInfo>& channels, int32_t& mask_channel)
    {
       const auto record_offset = info.offset();
       layer._bounds._top = info.i32();
@@ -1385,16 +1467,127 @@ private:
       // layers without extra data have no name and no section key (fix from deceptus: f8ccfc29)
       if (extra_length > 0)
       {
-         parseLayerExtraData(extra, layer);
+         parseLayerExtraData(extra, layer, channels, mask_channel);
       }
       return true;
    }
 
+   /// \brief the layer mask / adjustment layer data of a layer record.
+   struct MaskBlock
+   {
+      bool _present{false};
+      Rect _bounds;
+      uint8_t _default_color{0};
+      uint8_t _flags{0};
+      bool _has_real{false};
+      Rect _real_bounds;
+      uint8_t _real_default_color{0};
+      uint8_t _real_flags{0};
+      std::optional<uint8_t> _user_density;
+      std::optional<double> _user_feather;
+      std::optional<uint8_t> _vector_density;
+      std::optional<double> _vector_feather;
+   };
+
+   [[nodiscard]] static Rect readRect(Reader& reader)
+   {
+      Rect rect;
+      rect._top = reader.i32();
+      rect._left = reader.i32();
+      rect._bottom = reader.i32();
+      rect._right = reader.i32();
+      return rect;
+   }
+
+   [[nodiscard]] static bool plausibleRect(const Rect& rect)
+   {
+      const auto width = static_cast<int64_t>(rect._right) - rect._left;
+      const auto height = static_cast<int64_t>(rect._bottom) - rect._top;
+      return width >= 0 && height >= 0 && width <= max_dimension && height <= max_dimension;
+   }
+
+   /// \return the size of the mask parameters: their flag byte plus a density byte or a feather double for each bit
+   [[nodiscard]] static std::size_t maskParametersSize(uint8_t parameters)
+   {
+      return 1 + ((parameters & 0x01) != 0 ? 1 : 0) + ((parameters & 0x02) != 0 ? 8 : 0) + ((parameters & 0x04) != 0 ? 1 : 0) +
+             ((parameters & 0x08) != 0 ? 8 : 0);
+   }
+
+   /// \brief 0 bytes = no mask; otherwise rectangle, default color, flags, then optionally the "real" flags, default
+   ///        color and rectangle, then the mask parameters if flag bit 4 is set, or 2 bytes of padding.
+   ///        photoshop writes the real fields before the parameters, against the specification (psd-tools found the
+   ///        same). whether real fields are there follows from which layout adds up to the block size; the size alone
+   ///        is ambiguous, two feathers make a block without real fields as long as one with them.
+   [[nodiscard]] static MaskBlock parseMaskBlock(Reader block)
+   {
+      MaskBlock mask;
+      const auto size = block.remaining();
+      if (size < 18)
+      {
+         return mask;
+      }
+      mask._bounds = readRect(block);
+      mask._default_color = block.u8();
+      mask._flags = block.u8();
+      const auto has_parameters = (mask._flags & 0x10) != 0;
+
+      // the parameter flag byte at the position each layout would put it
+      const auto parameters_at = [&](std::size_t skip)
+      {
+         auto probe = block;
+         probe.skip(skip);
+         return probe.u8();
+      };
+      const auto rest = block.remaining();
+      const auto fits = [&](std::size_t used) { return used <= rest && rest - used < 4; };  // a little padding is fine
+      auto has_real = rest >= 18;
+      if (has_parameters)
+      {
+         // set parameter flags are part of each candidate: bit 4 promises at least one parameter
+         const auto real_parameters = rest >= 18 ? parameters_at(18) : uint8_t{0};
+         const auto real_used = 18 + maskParametersSize(real_parameters);
+         const auto plain_used = maskParametersSize(parameters_at(0));
+         const auto real_fits = rest >= 18 && (real_parameters & 0x0f) != 0 && fits(real_used);
+         const auto plain_fits = fits(plain_used);
+         has_real = real_fits && (!plain_fits || real_used == rest || plain_used != rest);
+      }
+      if (has_real)
+      {
+         mask._real_flags = block.u8();
+         mask._real_default_color = block.u8();
+         mask._real_bounds = readRect(block);
+         mask._has_real = true;
+      }
+      if (has_parameters)
+      {
+         const auto parameters = block.u8();
+         if ((parameters & 0x01) != 0)
+         {
+            mask._user_density = block.u8();
+         }
+         if ((parameters & 0x02) != 0)
+         {
+            mask._user_feather = block.f64();
+         }
+         if ((parameters & 0x04) != 0)
+         {
+            mask._vector_density = block.u8();
+         }
+         if ((parameters & 0x08) != 0)
+         {
+            mask._vector_feather = block.f64();
+         }
+      }
+      mask._present = !block.failed();
+      return mask;
+   }
+
    /// \brief mask data, blending ranges, the name, then tagged blocks. all optional, so a malformed part ends
    ///        the parsing of the extra data instead of the load.
-   void parseLayerExtraData(Reader& extra, Layer& layer)
+   void parseLayerExtraData(Reader& extra, Layer& layer, const std::vector<ChannelInfo>& channels, int32_t& mask_channel)
    {
-      extra.skip(extra.u32());  // layer mask / adjustment layer data
+      const auto mask_length = extra.u32();
+      const auto mask_block = parseMaskBlock(extra.sub(mask_length));
       extra.skip(extra.u32());  // layer blending ranges
 
       // pascal string padded to a multiple of 4 bytes, including the length byte
@@ -1406,6 +1599,7 @@ private:
          return;
       }
       layer._name = latin1ToUtf8(name);
+      applyMaskBlock(mask_block, layer, channels, mask_channel);
 
       while (extra.remaining() >= 12)
       {
@@ -1433,6 +1627,24 @@ private:
             }
          }
 
+         // vector mask: version, flags (invert, not linked, disabled), then path records. 'vsms' is the newer key
+         if ((key == fourCc("vmsk") || key == fourCc("vsms")) && !layer._vector_mask.has_value())
+         {
+            (void)block.u32();  // version, 3
+            const auto flags = block.u32();
+            if (!block.failed())
+            {
+               VectorMask mask;
+               mask._inverted = (flags & 0x01) != 0;
+               mask._linked = (flags & 0x02) == 0;
+               mask._disabled = (flags & 0x04) != 0;
+               mask._density = mask_block._vector_density;
+               mask._feather = mask_block._vector_feather;
+               mask._subpaths = parsePathRecords(block, &mask._starts_filled);
+               layer._vector_mask = std::move(mask);
+            }
+         }
+
          // unicode name: 4 byte count of utf-16 code units, then the code units. the old loader kept only the
          // low byte of each unit
          if (key == fourCc("luni"))
@@ -1451,7 +1663,38 @@ private:
       }
    }
 
-   bool parseLayerPixels(Reader& info, Layer& layer, const std::vector<ChannelInfo>& channels)
+   /// \brief a raster mask exists if its channel does: -3 together with the "real" fields, else -2. a layer with
+   ///        only a vector mask has the mask fields but no mask channel.
+   static void applyMaskBlock(const MaskBlock& block, Layer& layer, const std::vector<ChannelInfo>& channels, int32_t& mask_channel)
+   {
+      const auto has_channel = [&](int32_t id)
+      { return std::ranges::any_of(channels, [id](const ChannelInfo& channel) { return channel._id == id; }); };
+      if (!block._present)
+      {
+         return;
+      }
+      const auto use_real = block._has_real && has_channel(-3);
+      if (!use_real && !has_channel(-2))
+      {
+         return;
+      }
+      LayerMask mask;
+      mask._bounds = use_real ? block._real_bounds : block._bounds;
+      mask._default_color = use_real ? block._real_default_color : block._default_color;
+      const auto flags = use_real ? block._real_flags : block._flags;
+      mask._relative_to_layer = (flags & 0x01) != 0;
+      mask._disabled = (flags & 0x02) != 0;
+      mask._density = block._user_density;
+      mask._feather = block._user_feather;
+      if (!plausibleRect(mask._bounds))
+      {
+         return;
+      }
+      layer._mask = std::move(mask);
+      mask_channel = use_real ? -3 : -2;
+   }
+
+   bool parseLayerPixels(Reader& info, Layer& layer, const std::vector<ChannelInfo>& channels, int32_t mask_channel)
    {
       const auto width = layer._bounds.width();
       const auto height = layer._bounds.height();
@@ -1471,7 +1714,24 @@ private:
             return false;
          }
 
-         // masks (-2, -3) have their own rectangle and are not decoded
+         // the raster mask has its own rectangle, and holds coverage rather than color
+         if (channel._id == mask_channel && layer._mask.has_value() && _options._load_layer_pixels)
+         {
+            auto& mask = *layer._mask;
+            const auto mask_width = mask._bounds.width();
+            const auto mask_height = mask._bounds.height();
+            if (mask_width > 0 && mask_height > 0)
+            {
+               if (!checkPixels(mask_width, mask_height, data.offset(), "layer mask") ||
+                   !decodeChannel(data, mask_width, mask_height, mask._values, SampleEncoding::Linear))
+               {
+                  return false;
+               }
+            }
+            continue;
+         }
+
+         // the other mask channel (-2 next to a "real" -3) and channels of other color modes are skipped
          const auto wanted = channel._id >= -1 && channel._id < colorChannelCount();
          if (!has_pixels || !_options._load_layer_pixels || !wanted)
          {
@@ -1504,7 +1764,8 @@ private:
    }
 
    /// \brief decodes one layer channel, compression field included, into width * height 8 bit values.
-   bool decodeChannel(Reader& data, int32_t width, int32_t height, std::vector<uint8_t>& values)
+   bool
+   decodeChannel(Reader& data, int32_t width, int32_t height, std::vector<uint8_t>& values, SampleEncoding encoding = SampleEncoding::Color)
    {
       const auto compression = data.u16();
       if (!checkRead(data, "channel compression"))
@@ -1530,13 +1791,13 @@ private:
          {
             const auto row = raw.subspan(static_cast<std::size_t>(y) * row_bytes, row_bytes);
             std::ranges::transform(row, samples.begin(), [](std::byte byte) { return std::to_integer<uint8_t>(byte); });
-            samplesTo8Bit(samples, _document._header._depth, rowOf(values, width, y));
+            samplesTo8Bit(samples, _document._header._depth, rowOf(values, width, y), encoding);
          }
          return true;
       }
       if (compression == 1)
       {
-         return decodeRleRows(data, width, height, 1, [&](int32_t, int32_t y) { return rowOf(values, width, y); });
+         return decodeRleRows(data, width, height, 1, [&](int32_t, int32_t y) { return rowOf(values, width, y); }, encoding);
       }
       if (compression == 2 || compression == 3)
       {
@@ -1553,7 +1814,7 @@ private:
             {
                undoPrediction(row, _document._header._depth, width);
             }
-            samplesTo8Bit(row, _document._header._depth, rowOf(values, width, y));
+            samplesTo8Bit(row, _document._header._depth, rowOf(values, width, y), encoding);
          }
          return true;
       }
@@ -1598,7 +1859,14 @@ private:
    /// \brief packbits rows: a table of compressed row sizes for all rows of all channels, then the rows.
    ///        output(channel, y) returns where the 8 bit values of that row go.
    template <class Output>
-   bool decodeRleRows(Reader& data, int32_t width, int32_t height, int32_t channel_count, Output&& output)
+   bool decodeRleRows(
+      Reader& data,
+      int32_t width,
+      int32_t height,
+      int32_t channel_count,
+      Output&& output,
+      SampleEncoding encoding = SampleEncoding::Color
+   )
    {
       const auto row_count = static_cast<std::size_t>(height) * static_cast<std::size_t>(channel_count);
       std::vector<uint16_t> row_sizes(row_count);
@@ -1640,7 +1908,7 @@ private:
             }
             else
             {
-               samplesTo8Bit(samples, _document._header._depth, destination);
+               samplesTo8Bit(samples, _document._header._depth, destination, encoding);
             }
          }
       }

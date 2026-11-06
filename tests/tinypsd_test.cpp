@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
@@ -270,7 +272,7 @@ TEST_CASE("groups, flags, unicode names and masks")
    {
       content._channels.push_back({id, pattern(5, 3, id + 2), test::Compression::PackBits});
    }
-   // a user mask with its own rectangle must be skipped without disturbing the next layer
+   // a user mask with its own rectangle, decoded without disturbing the next layer
    content._channels.push_back({-2, pattern(3, 7, 9), test::Compression::Raw});
    content._mask_top = 0;
    content._mask_left = 0;
@@ -309,6 +311,8 @@ TEST_CASE("groups, flags, unicode names and masks")
    CHECK((layer._blend_mode == std::array{'m', 'u', 'l', ' '}));
    CHECK(layer.isImageLayer());
    CHECK(imageMatches(layer._image, {pattern(5, 3, 2), pattern(5, 3, 3), pattern(5, 3, 4), pattern(5, 3, 1)}));
+   CHECK(layer._mask.has_value() && layer._mask->_values == pattern(3, 7, 9) && layer._mask->_bounds.width() == 3);
+   CHECK(!layer._vector_mask.has_value());
 
    CHECK(document._layers[2]._section_divider == tinypsd::SectionDivider::ClosedFolder);
    CHECK(document._layers[3]._section_divider == tinypsd::SectionDivider::OpenFolder);
@@ -353,6 +357,227 @@ TEST_CASE("paths are read from the image resources")
       CHECK(std::abs(knot._anchor._x - 150.0f) < 0.01f && std::abs(knot._anchor._y - 50.0f) < 0.01f);
       CHECK(knot._linked);
    }
+}
+
+TEST_CASE("raster masks: bounds, default color, flags, parameters")
+{
+   test::DocumentData data{._width = 20, ._height = 10};
+   test::LayerData layer{1, 1, 5, 6};
+   for (const auto id : std::to_array<int16_t>({0, 1, 2}))
+   {
+      layer._channels.push_back({id, pattern(5, 4, id), test::Compression::Raw});
+   }
+   layer._channels.push_back({-2, pattern(6, 6, 5), test::Compression::PackBits});
+   layer._mask_top = 0;
+   layer._mask_left = 2;
+   layer._mask_bottom = 6;
+   layer._mask_right = 8;
+   layer._mask_default_color = 0;
+   layer._mask_flags = 0x01 | 0x02;  // relative to layer, disabled
+   layer._mask_density = uint8_t{200};
+   layer._mask_feather = 2.5;
+   layer._name = "masked";
+   data._layers = {layer};
+
+   const auto document = loadOrFail(test::writePsd(data));
+   CHECK(document._layers.size() == 1 && document._layers[0]._mask.has_value());
+   if (document._layers.empty() || !document._layers[0]._mask)
+   {
+      return;
+   }
+   const auto& mask = *document._layers[0]._mask;
+   CHECK(mask._bounds._top == 0 && mask._bounds._left == 2 && mask._bounds.width() == 6 && mask._bounds.height() == 6);
+   CHECK(mask._values == pattern(6, 6, 5));
+   CHECK(mask._default_color == 0);
+   CHECK(mask._relative_to_layer && mask._disabled);
+   CHECK(mask._density == uint8_t{200});
+   CHECK(mask._feather == 2.5);
+
+   // valueAt works in document pixels and falls back to the default color outside the mask rectangle
+   CHECK(mask.valueAt(2, 0) == pattern(6, 6, 5)[0]);
+   CHECK(mask.valueAt(7, 5) == pattern(6, 6, 5)[35]);
+   CHECK(mask.valueAt(1, 0) == 0 && mask.valueAt(8, 0) == 0 && mask.valueAt(2, 6) == 0);
+
+   // without pixels the mask is still described, just without values
+   const auto described = tinypsd::load(test::writePsd(data), {._load_layer_pixels = false});
+   CHECK(described && described->_layers[0]._mask && described->_layers[0]._mask->_values.empty());
+}
+
+TEST_CASE("raster masks: the 'real' user mask (-3) wins over -2")
+{
+   test::DocumentData data{._width = 16, ._height = 16};
+   test::LayerData layer{0, 0, 4, 4};
+   for (const auto id : std::to_array<int16_t>({0, 1, 2}))
+   {
+      layer._channels.push_back({id, pattern(4, 4, id), test::Compression::Raw});
+   }
+   layer._channels.push_back({-2, pattern(3, 3, 7), test::Compression::Raw});
+   layer._channels.push_back({-3, pattern(5, 2, 8), test::Compression::ZipPredicted});
+   layer._mask_right = 3;
+   layer._mask_bottom = 3;
+   layer._real_mask = true;
+   layer._real_mask_top = 10;
+   layer._real_mask_left = 9;
+   layer._real_mask_bottom = 12;
+   layer._real_mask_right = 14;
+   layer._real_mask_default_color = 255;
+   layer._real_mask_flags = 0x02;
+   layer._vector_mask = {{{0.1f, 0.1f}, {0.9f, 0.1f}, {0.5f, 0.9f}}};
+   data._layers = {layer};
+
+   const auto document = loadOrFail(test::writePsd(data));
+   const auto& mask = document._layers.empty() ? std::optional<tinypsd::LayerMask>{} : document._layers[0]._mask;
+   CHECK(mask.has_value());
+   if (mask)
+   {
+      CHECK(mask->_bounds._top == 10 && mask->_bounds._left == 9 && mask->_bounds.width() == 5 && mask->_bounds.height() == 2);
+      CHECK(mask->_values == pattern(5, 2, 8));
+      CHECK(mask->_default_color == 255 && mask->_disabled);
+   }
+   CHECK(!document._layers.empty() && document._layers[0]._vector_mask.has_value());
+}
+
+TEST_CASE("vector masks: flags, parameters and knots in document pixels")
+{
+   test::DocumentData data{._width = 200, ._height = 100};
+   test::LayerData shape{10, 20, 30, 60};
+   for (const auto id : std::to_array<int16_t>({0, 1, 2}))
+   {
+      shape._channels.push_back({id, pattern(40, 20, id), test::Compression::PackBits});
+   }
+   shape._name = "shape";
+   shape._vector_mask = {{{0.25f, 0.5f}, {0.75f, 0.5f}, {0.5f, 0.25f}}, {{0.1f, 0.1f}, {0.2f, 0.2f}}};
+   shape._vector_mask_new_key = true;
+   shape._vector_mask_flags = 0x01 | 0x02 | 0x04;
+   shape._vector_mask_starts_filled = true;
+   shape._vector_mask_density = uint8_t{128};
+   shape._vector_mask_feather = 1.5;
+
+   test::LayerData plain = shape;
+   plain._name = "plain";
+   plain._vector_mask = {{{0.0f, 0.0f}, {1.0f, 1.0f}}};
+   plain._vector_mask_new_key = false;
+   plain._vector_mask_flags = 0;
+   plain._vector_mask_starts_filled = false;
+   plain._vector_mask_density.reset();
+   plain._vector_mask_feather.reset();
+   data._layers = {shape, plain};
+
+   const auto document = loadOrFail(test::writePsd(data));
+   CHECK(document._layers.size() == 2);
+   if (document._layers.size() != 2 || !document._layers[0]._vector_mask || !document._layers[1]._vector_mask)
+   {
+      CHECK(false);
+      return;
+   }
+
+   // a vector mask alone has no raster mask, and the layer pixels are unaffected
+   const auto& layer = document._layers[0];
+   CHECK(!layer._mask.has_value());
+   CHECK(imageMatches(layer._image, {pattern(40, 20, 0), pattern(40, 20, 1), pattern(40, 20, 2), {}}));
+
+   const auto& mask = *layer._vector_mask;
+   CHECK(mask._inverted && !mask._linked && mask._disabled && mask._starts_filled);
+   CHECK(mask._density == uint8_t{128} && mask._feather == 1.5);
+   CHECK(mask._subpaths.size() == 2);
+   if (mask._subpaths.size() == 2 && mask._subpaths[0]._knots.size() == 3)
+   {
+      CHECK(mask._subpaths[0]._closed && mask._subpaths[1]._knots.size() == 2);
+      const auto& knot = mask._subpaths[0]._knots[1];
+      CHECK(std::abs(knot._anchor._x - 150.0f) < 0.01f && std::abs(knot._anchor._y - 50.0f) < 0.01f);
+   }
+
+   const auto& plain_mask = *document._layers[1]._vector_mask;
+   CHECK(!plain_mask._inverted && plain_mask._linked && !plain_mask._disabled && !plain_mask._starts_filled);
+   CHECK(!plain_mask._density && !plain_mask._feather);
+   CHECK(plain_mask._subpaths.size() == 1 && plain_mask._subpaths[0]._knots.size() == 2);
+}
+
+TEST_CASE("mask block layouts: real fields before parameters, and the ambiguous full parameter set")
+{
+   const auto make_layer = [](bool real)
+   {
+      test::LayerData layer{0, 0, 2, 2};
+      for (const auto id : std::to_array<int16_t>({0, 1, 2}))
+      {
+         layer._channels.push_back({id, pattern(2, 2, id), test::Compression::Raw});
+      }
+      layer._channels.push_back({real ? int16_t{-3} : int16_t{-2}, pattern(3, 1, 4), test::Compression::Raw});
+      layer._mask_right = real ? 0 : 3;
+      layer._mask_bottom = real ? 0 : 1;
+      layer._real_mask = real;
+      layer._real_mask_right = 3;
+      layer._real_mask_bottom = 1;
+      // all four parameters: 19 bytes after the header, as long as real fields plus one parameter byte would be.
+      // the feathers end in a zero byte, which is where a real layout would look for its parameter flags
+      layer._mask_density = uint8_t{10};
+      layer._mask_feather = 3.0;
+      layer._vector_mask_density = uint8_t{20};
+      layer._vector_mask_feather = 4.0;
+      return layer;
+   };
+
+   for (const auto real : {false, true})
+   {
+      test::DocumentData data{._width = 4, ._height = 4};
+      data._layers = {make_layer(real)};
+      const auto document = loadOrFail(test::writePsd(data));
+      const auto* const mask = document._layers.empty() || !document._layers[0]._mask ? nullptr : &*document._layers[0]._mask;
+      CHECK_MESSAGE(mask != nullptr, "real {}: no mask", real);
+      if (mask == nullptr)
+      {
+         continue;
+      }
+      CHECK_MESSAGE(mask->_bounds.width() == 3 && mask->_bounds.height() == 1, "real {}: bounds", real);
+      CHECK_MESSAGE(mask->_values == pattern(3, 1, 4), "real {}: values", real);
+      CHECK_MESSAGE(mask->_density == uint8_t{10} && mask->_feather == 3.0, "real {}: parameters", real);
+   }
+}
+
+TEST_CASE("16 and 32 bit masks are coverage, not srgb encoded colors")
+{
+   // 0.5 in a 32 bit mask is half coverage, 128; the srgb curve used for 32 bit colors would make it 188
+   const auto float_bytes = [](float value)
+   {
+      const auto bits = std::bit_cast<uint32_t>(value);
+      return std::vector<uint8_t>{
+         static_cast<uint8_t>(bits >> 24), static_cast<uint8_t>(bits >> 16), static_cast<uint8_t>(bits >> 8), static_cast<uint8_t>(bits)
+      };
+   };
+   test::DocumentData data{._width = 4, ._height = 4, ._depth = 32};
+   test::LayerData layer{0, 0, 1, 1};
+   for (const auto id : std::to_array<int16_t>({0, 1, 2}))
+   {
+      layer._channels.push_back({id, float_bytes(0.5f), test::Compression::Raw});
+   }
+   auto mask_samples = float_bytes(0.5f);
+   const auto opaque = float_bytes(1.0f);
+   mask_samples.insert(mask_samples.end(), opaque.begin(), opaque.end());
+   layer._channels.push_back({-2, mask_samples, test::Compression::ZipPredicted});
+   layer._mask_right = 2;
+   layer._mask_bottom = 1;
+   data._layers = {layer};
+
+   const auto document = loadOrFail(test::writePsd(data));
+   CHECK(!document._layers.empty() && document._layers[0]._mask.has_value());
+   if (!document._layers.empty() && document._layers[0]._mask)
+   {
+      CHECK(document._layers[0]._mask->_values == std::vector<uint8_t>({128, 255}));
+      CHECK(document._layers[0]._image._pixels[0] == 188);  // the color channel keeps the srgb curve
+   }
+
+   test::DocumentData data16{._width = 4, ._height = 4, ._depth = 16};
+   test::LayerData layer16{0, 0, 1, 1};
+   for (const auto id : std::to_array<int16_t>({0, 1, 2}))
+   {
+      layer16._channels.push_back({id, {0x80, 0x00}, test::Compression::Raw});
+   }
+   layer16._channels.push_back({-2, {0x80, 0x00}, test::Compression::PackBits});
+   layer16._mask_right = 1;
+   layer16._mask_bottom = 1;
+   data16._layers = {layer16};
+   const auto document16 = loadOrFail(test::writePsd(data16));
+   CHECK(!document16._layers.empty() && document16._layers[0]._mask && document16._layers[0]._mask->_values == std::vector<uint8_t>({128}));
 }
 
 // ----------------------------------------------------------------------------------------------------
@@ -501,6 +726,15 @@ std::vector<std::byte> featureRichFile()
    divider._name = "</Layer group>";
    divider._section_divider = 3;
    data._layers.insert(data._layers.begin(), divider);
+   auto& masked = data._layers[1];
+   masked._channels.push_back({-2, std::vector<uint8_t>(5 * 4 * 2, uint8_t{0x40}), test::Compression::PackBits});
+   masked._mask_top = 1;
+   masked._mask_left = 2;
+   masked._mask_bottom = 5;
+   masked._mask_right = 7;
+   masked._mask_density = uint8_t{180};
+   masked._vector_mask_feather = 3.0;
+   masked._vector_mask = {{{0.1f, 0.1f}, {0.8f, 0.2f}, {0.4f, 0.9f}}};
    data._path = {{0.1f, 0.2f}, {0.3f, 0.4f}, {0.5f, 0.6f}};
    data._composite_compression = test::Compression::PackBits;
    return test::writePsd(data);
@@ -549,6 +783,13 @@ TEST_CASE("random corruption never crashes")
          {
             const auto expected = static_cast<std::size_t>(layer._image._width) * static_cast<std::size_t>(layer._image._height) * 4;
             CHECK(layer._image._pixels.size() == expected);
+            if (layer._mask && !layer._mask->_values.empty())
+            {
+               const auto mask_size =
+                  static_cast<std::size_t>(layer._mask->_bounds.width()) * static_cast<std::size_t>(layer._mask->_bounds.height());
+               CHECK(layer._mask->_values.size() == mask_size);
+               (void)layer._mask->valueAt(layer._mask->_bounds._right - 1, layer._mask->_bounds._bottom - 1);
+            }
          }
       }
    }
