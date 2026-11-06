@@ -1739,7 +1739,9 @@ private:
          }
 
          Plane plane{channel._id, {}};
-         if (!decodeChannel(data, width, height, plane._values))
+         // transparency is coverage, so it stays linear in 32 bit documents like the masks
+         const auto encoding = channel._id == -1 ? SampleEncoding::Linear : SampleEncoding::Color;
+         if (!decodeChannel(data, width, height, plane._values, encoding))
          {
             return false;
          }
@@ -1858,6 +1860,7 @@ private:
 
    /// \brief packbits rows: a table of compressed row sizes for all rows of all channels, then the rows.
    ///        output(channel, y) returns where the 8 bit values of that row go.
+   /// \param linear_channel a channel that holds coverage (the composite's transparency) and stays linear, or -1
    template <class Output>
    bool decodeRleRows(
       Reader& data,
@@ -1865,7 +1868,8 @@ private:
       int32_t height,
       int32_t channel_count,
       Output&& output,
-      SampleEncoding encoding = SampleEncoding::Color
+      SampleEncoding encoding = SampleEncoding::Color,
+      int32_t linear_channel = -1
    )
    {
       const auto row_count = static_cast<std::size_t>(height) * static_cast<std::size_t>(channel_count);
@@ -1908,7 +1912,7 @@ private:
             }
             else
             {
-               samplesTo8Bit(samples, _document._header._depth, destination, encoding);
+               samplesTo8Bit(samples, _document._header._depth, destination, channel == linear_channel ? SampleEncoding::Linear : encoding);
             }
          }
       }
@@ -2018,6 +2022,8 @@ private:
          }
          return discarded;
       };
+      // the transparency is coverage and stays linear in 32 bit documents; colors get the srgb curve
+      const auto encodingOf = [&](int32_t channel) { return channel == alpha_index ? SampleEncoding::Linear : SampleEncoding::Color; };
 
       if (compression == 0)
       {
@@ -2039,14 +2045,14 @@ private:
                }
                else
                {
-                  samplesTo8Bit(samples, header._depth, destination(channel, y));
+                  samplesTo8Bit(samples, header._depth, destination(channel, y), encodingOf(channel));
                }
             }
          }
       }
       else if (compression == 1)
       {
-         if (!decodeRleRows(_reader, header._width, header._height, header._channels, destination))
+         if (!decodeRleRows(_reader, header._width, header._height, header._channels, destination, SampleEncoding::Color, alpha_index))
          {
             return false;
          }
@@ -2077,7 +2083,7 @@ private:
                }
                else
                {
-                  samplesTo8Bit(row, header._depth, destination(channel, y));
+                  samplesTo8Bit(row, header._depth, destination(channel, y), encodingOf(channel));
                }
             }
          }

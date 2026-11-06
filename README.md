@@ -72,7 +72,7 @@ one instead); the shapes are in `_vector_mask`. tinypsd does not apply masks to 
 | | |
 |---|---|
 | color modes | RGB, grayscale, CMYK, indexed, duotone (as its gray ramp), bitmap; all become 8 bit RGBA |
-| bit depths | 1 (bitmap), 8, 16 and 32 bit. photoshop's 32 bit documents are linear and get the sRGB curve, so they match the 16 bit save of the same image |
+| bit depths | 1 (bitmap), 8, 16 and 32 bit. photoshop's 32 bit documents are linear and their colors get the sRGB curve, so they match the 16 bit save of the same image; transparency and masks are coverage and stay linear |
 | compression | raw, PackBits (RLE), zip and zip with prediction, which photoshop uses for 16 and 32 bit layers |
 | layers | names (unicode), bounds, opacity, visibility, clipping, blend mode key, groups (nested too), transparency |
 | masks | raster layer masks (bounds, default color, flags, density, feather, 8 bit coverage) and vector masks (bezier subpaths, flags) |
